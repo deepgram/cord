@@ -1,0 +1,20 @@
+[package]
+name = "actix-ws-proxy"
+version = "0.1.0"
+authors = ["Nikola Whallon <nikola@deepgram.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix = "^0.7"
+actix-web = { version = "^0.7.19", features = ["rust-tls"] }
+futures = { version = "0.3", features = ["compat"] }
+chrono = "^0.4"
+log = "^0.4"
+env_logger = "^0.5"
+structopt = "^0.2"
+serde_urlencoded = "^0.5"
+failure = { version = "^0.1", features = ["backtrace"] }
+openssl-probe = "^0.1"
+
