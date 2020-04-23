@@ -14,6 +14,8 @@ mod logging;
 
 mod query_string;
 use query_string::QueryString;
+use std::borrow::BorrowMut;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 fn ws_index(req: HttpRequest, destination_url: String) -> Result<HttpResponse, ActixError> {
@@ -25,22 +27,41 @@ pub struct WsProxy {
     destination_url: String,
     query_string: QueryString,
     auth_header: header::HeaderValue,
+    buffer: Vec<ws::Message>,
+    connections: HashMap<String, Connection>,
+    current_model: String,
+}
+
+// TODO: make this an actor, that way I can carry more info (like what model was used) - or, make stem OPTIONALLY return the model used with results
+#[derive(Default)]
+pub struct Connection {
     reader: Option<ws::ClientReader>,
     writer: Option<ws::ClientWriter>,
-    buffer: Vec<ws::Message>,
 }
 
 impl WsProxy {
     pub fn with_request(req: HttpRequest, destination_url: String) -> Result<Self, ActixError> {
         match req.headers().get(header::AUTHORIZATION) {
-            Some(auth_header) => Ok(Self {
-                destination_url,
-                query_string: QueryString::from_str(req.query_string())?,
-                auth_header: auth_header.clone(),
-                reader: None,
-                writer: None,
-                buffer: Vec::new(),
-            }),
+            Some(auth_header) => {
+                let query_string = QueryString::from_str(req.query_string())?;
+
+                let mut connections = HashMap::new();
+
+                // TODO: the following needs to be based on the model requested by the client, and its associated models
+                connections.insert("general".to_string(), Default::default());
+                connections.insert("phonecall".to_string(), Default::default());
+                connections.insert("meeting".to_string(), Default::default());
+                let current_model = "general".to_string();
+
+                Ok(Self {
+                    destination_url,
+                    query_string,
+                    auth_header: auth_header.clone(),
+                    buffer: Vec::new(),
+                    connections,
+                    current_model,
+                })
+            }
             None => {
                 error!("invalid or missing credentials");
                 Err(ErrorUnauthorized("Invalid or missing credentials."))
@@ -52,8 +73,36 @@ impl WsProxy {
 impl Actor for WsProxy {
     type Context = ws::WebsocketContext<Self>;
 
+    fn started(&mut self, ctx: &mut Self::Context) {
+        info!("WsProxy Actor has started");
+
+        // open connections to stem for each model
+        let mut keys = Vec::new();
+        for model in self.connections.keys() {
+            keys.push(model.clone());
+        }
+        for model in keys {
+            connect_to_destination_wrapper(
+                self.destination_url.clone(),
+                self.query_string.clone(),
+                model.clone().to_string(),
+                self.auth_header.clone(),
+                self,
+                ctx,
+            );
+        }
+    }
+
     fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
         info!("WsProxy Actor is stopping");
+
+        for (model, mut connection) in self.connections.drain() {
+            let writer = connection.writer.borrow_mut();
+            if let Some(writer) = writer.as_mut() {
+                info!("closing writer for model: {}", model);
+                writer.close(None);
+            }
+        }
 
         Running::Stop
     }
@@ -67,12 +116,22 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
     fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
         self.buffer.push(msg);
 
-        if let Some(writer) = self.writer.as_mut() {
+        if let Some(writer) = self
+            .connections
+            .get_mut(&self.current_model)
+            .unwrap()
+            .writer
+            .as_mut()
+        {
+            // TODO: check unwrap
             for msg in self.buffer.drain(..) {
                 match msg {
                     ws::Message::Text(text) => {
-                        trace!("text from client, to destination: {}", text.clone());
-                        writer.text(text.clone());
+                        info!(
+                            "text from client, will interpret as a model change: {}",
+                            text.clone()
+                        );
+                        self.current_model = text;
                     }
                     ws::Message::Binary(binary) => {
                         trace!(
@@ -90,11 +149,20 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
             }
         }
 
-        if self.writer.is_none() {
+        if self
+            .connections
+            .get_mut(&self.current_model)
+            .unwrap()
+            .writer
+            .is_none()
+        {
+            // TODO: check unwrap
             warn!("proxy is not ready yet, buffering message from client, to destination");
+            // TODO: don't try to reconnect if I'm already trying to reconnect ?
             connect_to_destination_wrapper(
                 self.destination_url.clone(),
                 self.query_string.clone(),
+                self.current_model.clone(),
                 self.auth_header.clone(),
                 self,
                 ctx,
@@ -119,6 +187,7 @@ impl StreamHandler<FromDestination, ws::ProtocolError> for WsProxy {
     fn handle(&mut self, msg: FromDestination, ctx: &mut Self::Context) {
         match msg.into_inner() {
             ws::Message::Text(text) => {
+                // TODO: analyze this text, using caged vocab, etc
                 trace!("text from destination, to client: {}", text);
                 ctx.text(text);
             }
@@ -142,22 +211,37 @@ impl StreamHandler<FromDestination, ws::ProtocolError> for WsProxy {
 pub fn connect_to_destination_wrapper(
     url: String,
     query_string: QueryString,
+    model: String,
     auth_header: header::HeaderValue,
     proxy: &mut WsProxy,
     ctx: &mut ws::WebsocketContext<WsProxy>,
 ) {
+    let mut query_string = query_string;
+    query_string.push("model", &model);
     let query_string = query_string.to_str().unwrap_or_default();
     let url = format!("{}?{}", url, query_string);
 
-    trace!("attempting to connect to url: {}", url.clone());
+    info!("attempting to connect to url: {}", url.clone());
 
     connect_to_destination(url.clone(), auth_header.clone())
         .into_actor(proxy)
-        .map(|(reader, writer), act, ctx| {
-            act.reader = Some(reader);
-            act.writer = Some(writer);
+        .map(move |(reader, writer), act, ctx| {
+            act.connections.insert(
+                model.clone(),
+                Connection {
+                    reader: Some(reader),
+                    writer: Some(writer),
+                },
+            );
             ctx.add_stream(Compat::new(
-                act.reader.take().unwrap().compat().map_ok(FromDestination),
+                act.connections
+                    .get_mut(&model.clone())
+                    .unwrap() // TODO: check this unwrap
+                    .reader
+                    .take()
+                    .unwrap()
+                    .compat()
+                    .map_ok(FromDestination),
             ));
         })
         .map_err(|err, _act, _ctx| {

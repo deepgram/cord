@@ -1,5 +1,5 @@
 [package]
-name = "actix-ws-proxy"
+name = "cord"
 version = "0.1.0"
 authors = ["Nikola Whallon <nikola@deepgram.com>"]
 edition = "2018"
