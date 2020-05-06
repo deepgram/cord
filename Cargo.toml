@@ -15,6 +15,8 @@ log = "^0.4"
 env_logger = "^0.5"
 structopt = "^0.2"
 serde_urlencoded = "^0.5"
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
 failure = { version = "^0.1", features = ["backtrace"] }
 openssl-probe = "^0.1"
 
