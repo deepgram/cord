@@ -20,20 +20,33 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-fn ws_index(req: HttpRequest, stem_url: String) -> Result<HttpResponse, ActixError> {
-    let ws_proxy = WsProxy::with_request(req.clone(), stem_url.clone())?;
+fn ws_index(
+    req: HttpRequest,
+    stem_url: String,
+    caging_url: String,
+) -> Result<HttpResponse, ActixError> {
+    let ws_proxy = WsProxy::with_request(req.clone(), stem_url.clone(), caging_url.clone())?;
     ws::start(&req, ws_proxy)
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct ModelVersion {
+    model: String,
+    version: String,
 }
 
 pub struct WsProxy {
     stem_url: String,
+    caging_url: String,
     query_string: QueryString,
     auth_header: header::HeaderValue,
     buffer: Vec<ws::Message>,
-    stem_connections: HashMap<String, Connection>,
-    current_model: String,
+    stem_connections: HashMap<ModelVersion, Connection>,
+    model_version: ModelVersion,
+    pow_model_version: ModelVersion,
+    current_model_version: ModelVersion,
     caging_connection: Connection,
-    current_vocab: String,
+    current_vocab: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -50,30 +63,54 @@ pub struct Connection {
 }
 
 impl WsProxy {
-    pub fn with_request(req: HttpRequest, stem_url: String) -> Result<Self, ActixError> {
+    pub fn with_request(
+        req: HttpRequest,
+        stem_url: String,
+        caging_url: String,
+    ) -> Result<Self, ActixError> {
         match req.headers().get(header::AUTHORIZATION) {
             Some(auth_header) => {
                 let query_string = QueryString::from_str(req.query_string())?;
 
+                let model = query_string
+                    .pairs
+                    .get("model")
+                    .unwrap_or(&"general".to_string())
+                    .clone();
+                let version = query_string
+                    .pairs
+                    .get("version")
+                    .unwrap_or(&"latest".to_string())
+                    .clone();
+
+                let model_version = ModelVersion {
+                    model: model.clone(),
+                    version: version.clone(),
+                };
+                let pow_model_version = ModelVersion {
+                    model: model.clone(),
+                    version: "pow".to_string(),
+                };
+
                 let mut stem_connections = HashMap::new();
 
-                // TODO: the following needs to be based on the model requested by the client, and its associated models
-                stem_connections.insert("general".to_string(), Default::default());
-                stem_connections.insert("phonecall".to_string(), Default::default());
-                stem_connections.insert("meeting".to_string(), Default::default());
-                let current_model = "general".to_string();
+                stem_connections.insert(model_version.clone(), Default::default());
+                stem_connections.insert(pow_model_version.clone(), Default::default());
+                let current_model_version = model_version.clone();
 
-                // TODO: need way to switch vocab
                 let caging_connection = Default::default();
-                let current_vocab = "aurora".to_string();
+                let current_vocab = None;
 
                 Ok(Self {
                     stem_url,
+                    caging_url,
                     query_string,
                     auth_header: auth_header.clone(),
                     buffer: Vec::new(),
                     stem_connections,
-                    current_model,
+                    model_version,
+                    pow_model_version,
+                    current_model_version,
                     caging_connection,
                     current_vocab,
                 })
@@ -94,14 +131,14 @@ impl Actor for WsProxy {
 
         // open connections to stem for each model
         let mut keys = Vec::new();
-        for model in self.stem_connections.keys() {
-            keys.push(model.clone());
+        for model_version in self.stem_connections.keys() {
+            keys.push(model_version.clone());
         }
-        for model in keys {
+        for model_version in keys {
             connect_to_stem_wrapper(
                 self.stem_url.clone(),
                 self.query_string.clone(),
-                model.clone().to_string(),
+                model_version.clone(),
                 self.auth_header.clone(),
                 self,
                 ctx,
@@ -109,18 +146,29 @@ impl Actor for WsProxy {
         }
 
         // open connection to the caging server
-        connect_to_caging_wrapper("ws://localhost:8765".to_string(), self, ctx);
+        connect_to_caging_wrapper(self.caging_url.clone(), self, ctx);
     }
 
     fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
         info!("WsProxy Actor is stopping");
 
-        for (model, mut stem_connection) in self.stem_connections.drain() {
+        if !self.buffer.is_empty() {
+            warn!(
+                "buffer not empty, will miss the last {} messages!",
+                self.buffer.len()
+            );
+        }
+
+        for (model_version, mut stem_connection) in self.stem_connections.drain() {
             let writer = stem_connection.writer.borrow_mut();
             if let Some(writer) = writer.as_mut() {
-                info!("closing writer for model: {}", model);
+                info!("closing writer for model_version: {:?}", model_version);
                 writer.close(None);
             }
+        }
+        if let Some(writer) = self.caging_connection.writer.as_mut() {
+            info!("closing writer caging server");
+            writer.close(None);
         }
 
         Running::Stop
@@ -137,7 +185,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
 
         if let Some(writer) = self
             .stem_connections
-            .get_mut(&self.current_model)
+            .get_mut(&self.current_model_version)
             .unwrap()
             .writer
             .as_mut()
@@ -148,10 +196,16 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
                     ws::Message::Text(text) => {
                         // TODO: make this a model or a vocab change, with only a couple of options
                         info!(
-                            "text from client, will interpret as a model change: {}",
+                            "text from client, will interpret as a vocab/model change: {}",
                             text.clone()
                         );
-                        self.current_model = text;
+                        if text == "" {
+                            self.current_vocab = None;
+                            self.current_model_version = self.model_version.clone();
+                        } else {
+                            self.current_vocab = Some(text);
+                            self.current_model_version = self.pow_model_version.clone();
+                        }
                     }
                     ws::Message::Binary(binary) => {
                         trace!(
@@ -162,6 +216,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
                     }
                     ws::Message::Close(reason) => {
                         info!("close from client with reason: {:?}", reason);
+                        ctx.close(reason.clone());
                         ctx.stop();
                     }
                     _ => (),
@@ -171,7 +226,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
 
         if self
             .stem_connections
-            .get_mut(&self.current_model)
+            .get_mut(&self.current_model_version)
             .unwrap()
             .writer
             .is_none()
@@ -182,12 +237,17 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
             connect_to_stem_wrapper(
                 self.stem_url.clone(),
                 self.query_string.clone(),
-                self.current_model.clone(),
+                self.current_model_version.clone(),
                 self.auth_header.clone(),
                 self,
                 ctx,
             );
         }
+    }
+
+    fn error(&mut self, err: ws::ProtocolError, _ctx: &mut Self::Context) -> Running {
+        error!("client stream got the error {:?} .", err); // TODO: should I do ctx.close here?
+        Running::Stop
     }
 }
 
@@ -204,31 +264,67 @@ impl Message for FromStem {
 }
 
 impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
-    fn handle(&mut self, msg: FromStem, _ctx: &mut Self::Context) {
+    fn handle(&mut self, msg: FromStem, ctx: &mut Self::Context) {
         if let Some(writer) = self.caging_connection.writer.as_mut() {
             match msg.into_inner() {
                 ws::Message::Text(text) => {
-                    trace!("text from stem, to caging: {}", text);
-                    let streaming_response: StreamingResponse =
-                        serde_json::from_str(&text).unwrap(); // TODO: check unwrap
-                    let to_caging = serde_json::to_string(&ToCaging {
-                        streaming_response,
-                        vocab: self.current_vocab.clone(),
-                    })
-                    .unwrap(); // TODO: check unwrap
-                    writer.text(to_caging);
+                    match &self.current_vocab {
+                        Some(current_vocab) => {
+                            let streaming_response: Result<
+                                StreamingResponse,
+                                serde_json::error::Error,
+                            > = serde_json::from_str(&text);
+                            match streaming_response {
+                                Ok(streaming_response) => {
+                                    trace!("text from stem, to caging: {}", text);
+                                    let to_caging = serde_json::to_string(&ToCaging {
+                                        streaming_response,
+                                        vocab: current_vocab.clone(),
+                                    })
+                                    .unwrap(); // TODO: check unwrap
+                                    writer.text(to_caging);
+                                }
+                                Err(_) => {
+                                    trace!("metadata text from stem, to client: {}", text);
+                                    ctx.text(text); // TODO: make sure the caging server can accept this
+                                }
+                            }
+                        }
+                        None => {
+                            trace!("text from stem, to client (not caged): {}", text); // TODO: have the caging server accept empty vocab (this helps ensure ordering)
+                            ctx.text(text);
+                        }
+                    }
                 }
                 ws::Message::Binary(binary) => {
-                    debug!(
+                    warn!(
                         "binary from stem, for some reason with length: {}",
                         binary.len()
                     );
                 }
+                ws::Message::Close(reason) => {
+                    info!("close from stem with reason: {:?}", reason);
+                    // TODO: check why I have to do this here
+                    if let Some(writer) = self.caging_connection.writer.as_mut() {
+                        info!("closing writer caging server because of close message from stem");
+                        writer.close(None);
+                    }
+                    self.caging_connection.writer = None;
+
+                    ctx.close(reason.clone());
+                    ctx.stop();
+                }
                 _ => {}
             }
         } else {
-            error!("connection to caging server not up");
+            error!("connection to caging server not up"); // TODO: reconnect ?
         }
+    }
+
+    fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
+        error!("stem stream got the error {:?} .", err);
+        ctx.close(None);
+        Running::Stop
     }
 }
 
@@ -266,18 +362,25 @@ impl StreamHandler<FromCaging, ws::ProtocolError> for WsProxy {
             _ => {}
         }
     }
+
+    fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
+        error!("caging stream got the error {:?} .", err);
+        ctx.close(None);
+        Running::Stop
+    }
 }
 
 pub fn connect_to_stem_wrapper(
     url: String,
     query_string: QueryString,
-    model: String,
+    model_version: ModelVersion,
     auth_header: header::HeaderValue,
     proxy: &mut WsProxy,
     ctx: &mut ws::WebsocketContext<WsProxy>,
 ) {
     let mut query_string = query_string;
-    query_string.push("model", &model);
+    query_string.push("model", &model_version.model);
+    query_string.push("version", &model_version.version);
     let query_string = query_string.to_str().unwrap_or_default();
     let url = format!("{}?{}", url, query_string);
 
@@ -287,7 +390,7 @@ pub fn connect_to_stem_wrapper(
         .into_actor(proxy)
         .map(move |(reader, writer), act, ctx| {
             act.stem_connections.insert(
-                model.clone(),
+                model_version.clone(),
                 Connection {
                     reader: Some(reader),
                     writer: Some(writer),
@@ -295,7 +398,7 @@ pub fn connect_to_stem_wrapper(
             );
             ctx.add_stream(Compat::new(
                 act.stem_connections
-                    .get_mut(&model.clone())
+                    .get_mut(&model_version.clone())
                     .unwrap() // TODO: check this unwrap
                     .reader
                     .take()
@@ -339,7 +442,7 @@ pub fn connect_to_caging_wrapper(
             ));
         })
         .map_err(|err, _act, _ctx| {
-            error!("failed to connect to stem: {:?}", err);
+            error!("failed to connect to staging: {:?}", err);
         })
         .wait(ctx);
 }
@@ -387,7 +490,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // TODO: add caging URL
     let stem_url = {
         match std::env::var("STEM_URL") {
             Ok(url) => Some(url),
@@ -400,11 +502,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    let caging_url = {
+        match std::env::var("CAGING_URL") {
+            Ok(url) => Some(url),
+            _ => None,
+        }
+    };
+
+    if caging_url.is_none() {
+        error!("failed to retreive CAGING_URL");
+        std::process::exit(1);
+    }
+
     server::new(move || {
         let stem_url = stem_url.clone().unwrap();
+        let caging_url = caging_url.clone().unwrap();
 
         App::new().resource("/", move |r| {
-            r.with(move |req| ws_index(req, stem_url.clone()))
+            r.with(move |req| ws_index(req, stem_url.clone(), caging_url.clone()))
         })
     })
     .bind(proxy_url.unwrap())

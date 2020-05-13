@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 #[derive(Default, Debug, Clone)]
 pub struct QueryString {
-    pairs: HashMap<String, String>,
+    pub pairs: HashMap<String, String>,
 }
 
 impl FromStr for QueryString {
