@@ -357,13 +357,13 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                                     writer.text(to_caging);
                                 }
                                 Err(_) => {
-                                    debug!("metadata text from stem, to client: {}", text);
+                                    debug!("metadata text from stem, to caging: {}", text);
                                     writer.text(text);
                                 }
                             }
                         }
                         None => {
-                            trace!("text from stem, to client (not caged): {}", text); // TODO: have the caging server accept empty vocab (this helps ensure ordering)
+                            trace!("text from stem, to caging: {}", text); // TODO: have the caging server accept empty vocab (this helps ensure ordering)
                             let streaming_response: Result<
                                 StreamingResponse,
                                 serde_json::error::Error,
@@ -384,11 +384,12 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                                         }
                                     }
 
-                                    ctx.text(serde_json::to_string(&streaming_response).unwrap());
+//                                    ctx.text(serde_json::to_string(&streaming_response).unwrap());
+                                    ctx.text(text);
                                     // TODO: check unwrap
                                 }
                                 Err(_) => {
-                                    debug!("metadata text from stem, to client: {}", text);
+                                    debug!("metadata text from stem, to caging: {}", text);
                                     writer.text(text);
                                 }
                             }
