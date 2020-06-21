@@ -51,6 +51,7 @@ pub struct WsProxy {
     temp_duration: HashMap<ModelVersion, f32>,
     offset_duration: f32,
     stop: bool,
+    force_stop: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -64,6 +65,8 @@ pub struct ToCaging {
 pub struct Connection {
     reader: Option<ws::ClientReader>,
     writer: Option<ws::ClientWriter>,
+    gracefully_closing: bool,
+    gracefully_closed: bool,
 }
 
 impl WsProxy {
@@ -125,6 +128,7 @@ impl WsProxy {
                     temp_duration,
                     offset_duration: 0.0,
                     stop: false,
+                    force_stop: false,
                 })
             }
             None => {
@@ -139,7 +143,7 @@ impl Actor for WsProxy {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        info!("WsProxy Actor has started");
+        debug!("WsProxy Actor has started");
 
         // open connections to stem for each model
         let mut keys = Vec::new();
@@ -162,14 +166,45 @@ impl Actor for WsProxy {
     }
 
     fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
-        info!("WsProxy Actor is stopping");
+        debug!("WsProxy Actor is stopping maybe");
 
-        if !self.stop {
-            info!("WsProxy Actor will continue, since we haven't gotten a request from the client to close the connection");
+        if !self.caging_connection.gracefully_closed && !self.force_stop {
+            debug!("WsProxy Actor will continue, since the caging connection has not yet gracefully stopped");
+            if !self.caging_connection.gracefully_closing {
+                debug!("caging not gracefully closing yet, meaning it has not been sent an empty byte, this will only happen after all stem instances have finished");
+                let mut all_stem_connections_gracefully_closed = true;
+                for (model_version, stem_connection) in self.stem_connections.iter_mut() {
+                    let writer = stem_connection.writer.borrow_mut().as_ref();
+                    if writer.is_none() {
+                        info!("stem connection for {:?} has gracefully closed", model_version);
+                        stem_connection.gracefully_closed = true;
+                    } else {
+                        info!("stem connection for {:?} has NOT gracefully closed", model_version);
+                        all_stem_connections_gracefully_closed = false;
+                    }
+                }
+
+                if all_stem_connections_gracefully_closed {
+                    debug!("all stem connections have gracefully closed, so we will send the empty byte to the caging connection");
+                    if let Some(writer) = self.caging_connection.writer.as_mut() {
+                        info!("all stem connections have gracefully stopped, so sending empty binary to caging connection");
+                        let empty: Vec<u8> = Vec::new();
+                        writer.binary(empty);
+                    } else {
+                        error!("for some reason, there is no caging connection writer!");
+                    }
+                    debug!("gracefully stopping caging connection");
+                    self.caging_connection.gracefully_closing = true;
+                }
+            }
             return Running::Continue;
         }
 
-        info!("WsProxy Actor will stop, since we did get a request from the client to close the connection");
+        if self.force_stop {
+            warn!("WsProxy Actor will stop, force stopping");
+        } else {
+            debug!("WsProxy Actor will stop, since we did get a request from the client to close the connection and the caging connection has gracefully stopped");
+        }
 
         if !self.buffer.is_empty() {
             warn!(
@@ -181,20 +216,20 @@ impl Actor for WsProxy {
         for (model_version, mut stem_connection) in self.stem_connections.drain() {
             let writer = stem_connection.writer.borrow_mut();
             if let Some(writer) = writer.as_mut() {
-                info!("closing writer for model_version: {:?}", model_version);
+                debug!("closing writer for model_version: {:?}", model_version);
                 writer.close(None);
             }
         }
         if let Some(writer) = self.caging_connection.writer.as_mut() {
-            info!("closing writer caging server");
-            writer.close(None);
+            warn!("closing writer caging server");
+//            writer.close(None); // TODO: probably I don't need this (since we've been guaranteed it's already been closed by the logic)
         }
 
         Running::Stop
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {
-        info!("WsProxy Actor has stopped");
+        debug!("WsProxy Actor has stopped");
     }
 }
 
@@ -216,7 +251,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
             );
             // TODO: don't try to reconnect if I'm already trying to reconnect ?
             if !self.switch_lock {
-                info!(
+                debug!(
                     "switch_lock is false, so the proxy should be (re)connected for {:?}",
                     self.current_model_version
                 );
@@ -229,7 +264,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
                     ctx,
                 );
             } else {
-                info!(
+                debug!(
                     "switch_lock is true, so the connection to stem for {:?} will be deferred",
                     self.current_model_version
                 );
@@ -237,6 +272,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
         }
 
         let mut kill_writer = false;
+        let mut gracefully_close_all_stem_connections = false;
 
         if let Some(writer) = self
             .stem_connections
@@ -278,21 +314,42 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for WsProxy {
                             binary.clone().len()
                         );
 
-                        // it the message was empty, interpret it as a stop command from the client
-                        // however, still proxy the message so that connections to stem get closed
+                        // if the message was empty, interpret it as a stop command from the client
+                        // however, still proxy the message so that connections to stem and caging get closed
                         if binary.is_empty() {
+                            info!("got an empty bte from the client! time to stop things");
                             self.stop = true;
+                            gracefully_close_all_stem_connections = true;
+                        } else {
+                            writer.binary(binary.clone());
                         }
-
-                        writer.binary(binary.clone());
                     }
                     ws::Message::Close(reason) => {
-                        info!("close from client with reason: {:?}", reason);
-                        ctx.close(reason.clone());
-                        ctx.stop();
+                        warn!("close from client with reason: {:?}", reason);
+                        //                        self.force_stop = true;
+                        //                        ctx.close(reason.clone());
+                        //                        ctx.stop();
                     }
                     _ => (),
                 }
+            }
+        }
+
+        if gracefully_close_all_stem_connections {
+            for (model_version, stem_connection) in self.stem_connections.iter_mut() {
+                if let Some(writer) = (*stem_connection).writer.as_mut() {
+                    info!(
+                        "sending empty binary to stem connection model_version: {:?}",
+                        model_version
+                    );
+                    let empty: Vec<u8> = Vec::new();
+                    writer.binary(empty);
+                }
+                info!(
+                    "gracefully stopping stem connection model_version: {:?}",
+                    model_version
+                );
+                stem_connection.gracefully_closing = true;
             }
         }
 
@@ -348,7 +405,7 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                                         }
                                     }
 
-                                    trace!("text from stem, to caging: {}", text);
+                                    trace!("text from stem {:?}, to caging: {}", msg.model_version, text);
                                     let to_caging = serde_json::to_string(&ToCaging {
                                         streaming_response: streaming_response.clone(),
                                         vocab: current_vocab.clone(),
@@ -357,7 +414,7 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                                     writer.text(to_caging);
                                 }
                                 Err(_) => {
-                                    debug!("metadata text from stem, to caging: {}", text);
+                                    debug!("metadata text from stem {:?}, to caging: {}", msg.model_version, text);
                                     writer.text(text);
                                 }
                             }
@@ -383,13 +440,10 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                                             word.end += self.offset_duration;
                                         }
                                     }
-
-//                                    ctx.text(serde_json::to_string(&streaming_response).unwrap());
-                                    ctx.text(text);
-                                    // TODO: check unwrap
+                                    writer.text(text);
                                 }
                                 Err(_) => {
-                                    debug!("metadata text from stem, to caging: {}", text);
+                                    debug!("metadata text from stem {:?}, to caging: {}", msg.model_version, text);
                                     writer.text(text);
                                 }
                             }
@@ -398,17 +452,36 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                 }
                 ws::Message::Binary(binary) => {
                     warn!(
-                        "binary from stem, for some reason with length: {}",
+                        "binary from stem {:?}, for some reason with length: {}",
+                        msg.model_version,
                         binary.len()
                     );
                 }
                 ws::Message::Close(reason) => {
-                    warn!("close from stem with reason: {:?}", reason);
+                    debug!(
+                        "close from stem with reason: {:?} for {:?}, closing this writer",
+                        msg.model_version,
+                        reason
+                    );
+                    if let Some(writer) = self
+                        .stem_connections
+                        .get_mut(&msg.model_version)
+                        .unwrap()
+                        .writer
+                        .as_mut()
+                    {
+//                        writer.close(None); // TODO: probably I don't need this and it's just causing a warning
+                    }
+                    self.stem_connections
+                        .get_mut(&msg.model_version)
+                        .unwrap()
+                        .writer = None;
 
                     self.switch_lock = false;
 
                     if !self.stop {
                         // re-connect to stem
+                        debug!("this request is not stopping, so we will reconnect to stem for {:?}", msg.model_version);
                         connect_to_stem_wrapper(
                             self.stem_url.clone(),
                             self.query_string.clone(),
@@ -422,7 +495,8 @@ impl StreamHandler<FromStem, ws::ProtocolError> for WsProxy {
                         self.offset_duration +=
                             self.temp_duration.get(&msg.model_version.clone()).unwrap();
                     } else {
-                        ctx.close(reason.clone());
+                        debug!("this request is stopping, so we will not reconnect to stem for {:?}", msg.model_version);
+                        //                        ctx.close(reason.clone());
                         ctx.stop();
                     }
                 }
@@ -461,14 +535,15 @@ impl StreamHandler<FromCaging, ws::ProtocolError> for WsProxy {
             }
             ws::Message::Binary(binary) => {
                 trace!(
-                    "trace - binary from caging, to client with length: {}",
+                    "binary from caging, to client with length: {}",
                     binary.len()
                 );
                 ctx.binary(binary);
             }
             ws::Message::Close(reason) => {
                 info!("close from caging with reason: {:?}", reason);
-                ctx.close(reason.clone());
+                self.caging_connection.gracefully_closed = true;
+                //                ctx.close(reason.clone());
                 ctx.stop();
             }
             _ => {}
@@ -490,13 +565,13 @@ pub fn connect_to_stem_wrapper(
     proxy: &mut WsProxy,
     ctx: &mut ws::WebsocketContext<WsProxy>,
 ) {
-    let mut query_string = query_string;
-    query_string.push("model", &model_version.model);
-    query_string.push("version", &model_version.version);
-    let query_string = query_string.to_str().unwrap_or_default();
-    let url = format!("{}?{}", url, query_string);
+    let mut query = query_string;
+    query.push("model", &model_version.model);
+    query.push("version", &model_version.version);
+    let query = query.to_str().unwrap_or_default();
+    let url = format!("{}?{}", url, query);
 
-    info!("attempting to connect to url: {}", url.clone());
+    debug!("attempting to connect to url: {}", url.clone());
 
     connect_to_stem(url.clone(), auth_header.clone())
         .into_actor(proxy)
@@ -506,6 +581,8 @@ pub fn connect_to_stem_wrapper(
                 Connection {
                     reader: Some(reader),
                     writer: Some(writer),
+                    gracefully_closing: false,
+                    gracefully_closed: false,
                 },
             );
             ctx.add_stream(Compat::new(
@@ -539,7 +616,7 @@ pub fn connect_to_caging_wrapper(
     proxy: &mut WsProxy,
     ctx: &mut ws::WebsocketContext<WsProxy>,
 ) {
-    info!("attempting to connect to url: {}", url.clone());
+    debug!("attempting to connect to url: {}", url.clone());
 
     connect_to_caging(url.clone())
         .into_actor(proxy)
